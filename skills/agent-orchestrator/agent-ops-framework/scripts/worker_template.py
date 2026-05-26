@@ -186,10 +186,19 @@ TASK_HANDLERS = {
 }
 
 def execute_task(task: dict) -> dict:
-    """Route task to appropriate handler."""
+    """Route task to appropriate handler. Reject if type not in capabilities."""
     task_type = task.get("task_type", "general")
     instruction = task.get("instruction", "")
     payload = task.get("payload", {}) or {}
+
+    # Reject if task_type not in capabilities (safety net after claim)
+    if task_type not in MY_CAPABILITIES:
+        return {
+            "status": "rejected",
+            "result": f"Task type '{task_type}' not in agent capabilities {MY_CAPABILITIES}",
+            "result_data": {}
+        }
+
     handler = TASK_HANDLERS.get(task_type, execute_general)
     return handler(instruction, payload)
 
@@ -285,6 +294,18 @@ def on_task_insert(payload):
         log(f"New task {task.get('task_id')} is blocked, skipping")
         return
     if task.get("task_type") not in MY_CAPABILITIES:
+        # Reject it — explicitly mark as rejected so orchestrator knows
+        task_id = task.get("id")
+        task_identifier = task.get("task_id", task_id)
+        source_ch = task.get("source_channel")
+        try:
+            supabase.table("agent_tasks").update({
+                "status": "rejected",
+                "error_message": f"task_type '{task.get('task_type')}' not in agent capabilities {MY_CAPABILITIES}"
+            }).eq("id", task_id).execute()
+            notify_discord(task_identifier, "rejected", f"{AGENT_NAME} rejected {task_identifier}: type not supported", source_ch)
+        except Exception as e:
+            log_error(f"Reject failed: {e}")
         return
     if task.get("assigned_to") and task.get("assigned_to") != AGENT_NAME:
         return
