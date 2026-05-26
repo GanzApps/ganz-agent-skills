@@ -309,17 +309,17 @@ def on_task_update(payload):
                 process_task(fresh.data)
         return
 
-    # If task was assigned to us and status changed to something else, update heartbeat
+    # If task was assigned to us and status changed to done/error, update heartbeat
     if task.get("assigned_to") == AGENT_NAME and task.get("status") in ("done", "error"):
         log(f"Our task {task.get('task_id')} marked {task.get('status')}")
         update_heartbeat("idle", None)
 
-    # DELETE handler — log cancelled task
-    if payload.get("type") == "DELETE" or not task.get("status"):
-        log(f"Task {task.get('task_id')} cancelled/deleted")
-
 def on_task_delete(payload):
-    """Task cancelled by conductor."""
+    """Task cancelled by conductor — handle via dedicated DELETE handler.
+    
+    Note: Supabase postgres_changes DELETE payload has no 'type' field.
+    The DELETE event is handled here; do NOT duplicate in on_task_update.
+    """
     old = payload.get("old", {})
     if not old:
         return
@@ -351,7 +351,13 @@ def subscribe_realtime():
 
 # ─── POLLING FALLBACK ─────────────────────────────────────────────────────
 def polling_loop():
-    """Fallback polling when Realtime is down. Also supplementary to Realtime."""
+    """
+    Supplementary polling thread — runs alongside Realtime callbacks.
+    Catches any events during Realtime reconnection windows.
+    
+    daemon=True: this thread dies with the main process, no cleanup needed.
+    SIGTERM → handle_shutdown() releases current_task before process exits.
+    """
     log(f"Polling active (every {POLL_INTERVAL}s)")
     while True:
         if shutdown_requested:
