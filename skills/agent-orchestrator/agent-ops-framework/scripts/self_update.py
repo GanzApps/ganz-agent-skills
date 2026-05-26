@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 SUPABASE_URL = "https://lyhhfqbkwamodswxewql.supabase.co"
 SUPABASE_KEY = os.environ.get("MISSION_CONTROL_SUPABASE_ANON_KEY", "")
 SKILL_VERSION = "v6"  # Current skill framework version
-GITHUB_URL = "https://github.com/GanzApps/ai-knowledge.git"
+GITHUB_URL = "https://github.com/GanzApps/ganz-agent-skills.git"
 GITHUB_BRANCH = "master"
 
 MY_NAME = os.environ.get("AGENT_NAME", "zeanna")
