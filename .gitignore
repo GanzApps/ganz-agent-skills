@@ -1,0 +1,16 @@
+# Env files
+.env
+.env.*
+*.pem
+*.key
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Secrets (do not commit)
+credentials/
+secrets/
