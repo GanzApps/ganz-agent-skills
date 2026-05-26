@@ -12,6 +12,7 @@ import sys
 import time
 import json
 import signal
+import threading
 from datetime import datetime
 from typing import Optional
 
@@ -23,7 +24,6 @@ AGENT_CAPABILITIES = os.getenv("AGENT_CAPABILITIES", "research,code,general").sp
 SKILL_VERSION = os.getenv("SKILL_VERSION", "v6.0.0")
 
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "30"))   # seconds
-REALTIME_RECONNECT_DELAY = 5                              # seconds
 
 MY_CAPABILITIES = [c.strip() for c in AGENT_CAPABILITIES]
 # ─────────────────────────────────────────────────────────────────────────
@@ -291,27 +291,43 @@ def on_task_insert(payload):
     process_task(task)
 
 def on_task_update(payload):
-    """Task updated — e.g. blocked_by cleared."""
-    task = payload.get("new", {}) or payload.get("old", {})
+    """Task updated — e.g. blocked_by cleared, or task unblocked."""
+    task = payload.get("new", {}) or {}
+    old = payload.get("old", {})
     if not task:
         return
-    # If blocked_by was cleared and task is pending, we can claim it
-    old = payload.get("old", {})
+
+    # Check if blocked_by was just cleared → task is now claimable
     was_blocked = old.get("blocked_by") and not task.get("blocked_by")
-    if was_blocked and task.get("status") == "pending":
-        log(f"Task {task.get('task_id')} unblocked, checking claimability")
-        if is_agent_idle():
-            process_task(task)
-    # If DELETE of our current task, nothing to do (already claimed)
-    if task.get("id") == current_task_id and task.get("status") == "deleted":
-        log_warn("Our current task was deleted mid-execution")
+    is_pending = task.get("status") == "pending"
+    if was_blocked and is_pending:
+        log(f"Task {task.get('task_id')} unblocked, attempting claim")
+        if is_agent_idle() and task.get("task_type") in MY_CAPABILITIES:
+            # Pull fresh task data to avoid race on claim
+            fresh = supabase.table("agent_tasks").select("*").eq("id", task["id"]).single().execute()
+            if fresh.data:
+                process_task(fresh.data)
+        return
+
+    # If task was assigned to us and status changed to something else, update heartbeat
+    if task.get("assigned_to") == AGENT_NAME and task.get("status") in ("done", "error"):
+        log(f"Our task {task.get('task_id')} marked {task.get('status')}")
+        update_heartbeat("idle", None)
+
+    # DELETE handler — log cancelled task
+    if payload.get("type") == "DELETE" or not task.get("status"):
+        log(f"Task {task.get('task_id')} cancelled/deleted")
 
 def on_task_delete(payload):
-    """Task cancelled."""
-    task = payload.get("old", {})
-    if not task:
+    """Task cancelled by conductor."""
+    old = payload.get("old", {})
+    if not old:
         return
-    log(f"Task {task.get('task_id')} cancelled")
+    task_id = old.get("task_id", "unknown")
+    log(f"Task {task_id} was cancelled")
+    # If we had claimed this task, release it
+    if old.get("assigned_to") == AGENT_NAME:
+        log_warn(f"Our task {task_id} was cancelled by conductor")
 
 def subscribe_realtime():
     """Subscribe to all agent_tasks events."""
@@ -335,8 +351,8 @@ def subscribe_realtime():
 
 # ─── POLLING FALLBACK ─────────────────────────────────────────────────────
 def polling_loop():
-    """Fallback polling when Realtime is down."""
-    log(f"Polling fallback active (every {POLL_INTERVAL}s)")
+    """Fallback polling when Realtime is down. Also supplementary to Realtime."""
+    log(f"Polling active (every {POLL_INTERVAL}s)")
     while True:
         if shutdown_requested:
             break
@@ -380,10 +396,15 @@ def main():
     # Report startup
     update_heartbeat("idle", None)
 
-    # Start Realtime subscription (with polling fallback)
+    # Start Realtime subscription (callbacks handle INSERT/UPDATE/DELETE)
     subscribe_realtime()
 
-    # Keep alive
+    # Also run polling loop in a thread — runs alongside Realtime callbacks
+    # This catches any events missed during reconnection windows
+    poll_thread = threading.Thread(target=polling_loop, daemon=True)
+    poll_thread.start()
+
+    # Keep heartbeat alive while both threads run
     while True:
         if shutdown_requested:
             break

@@ -3,24 +3,16 @@ name: agent-ops-framework
 version: 6.0.0
 date_added: "2026-05-18"
 last_updated: "2026-05-27"
-description: "Generic multi-agent task framework with Realtime + polling, atomic claim, and standard task handlers"
+description: "Multi-agent task framework with Supabase Realtime + polling, atomic claim, and standard task handlers. All Zeanna partner agents run this."
 category: agent-orchestration
 risk: medium
 ---
 
 # Agent Ops Framework v6.0.0
 
-Generic multi-agent task framework. All Zeanna partner agents (Mr. Kim, ZenoA, Miss X) run this framework to claim and execute tasks from a shared Supabase queue.
+Generic multi-agent task framework for Zeanna's partner agents (Mr. Kim, ZenoA, Miss X).
 
-## Version History
-
-| Version | Date | Key Changes |
-|---------|------|-------------|
-| v6.0.0 | 2026-05-27 | Realtime subscription + polling fallback, generic task handlers, INSERT/UPDATE/DELETE events |
-| v5.0.0 | 2026-05-18 | Source channel tracking, Working Agent thread, heartbeat |
-| v4.0.0 | 2026-05-15 | Unblock mechanism, agent heartbeat table |
-| v3.0.0 | 2026-05-10 | Multi-agent via Supabase |
-| v1-v2 | Earlier | Initial Zeanna setup |
+**Version:** All agents report `skill_version: v6.0.0` via heartbeat on startup.
 
 ---
 
@@ -29,176 +21,233 @@ Generic multi-agent task framework. All Zeanna partner agents (Mr. Kim, ZenoA, M
 ```
 Zeanna (Conductor)
     │
-    │ creates task with source_channel
+    │ INSERT task → agent_tasks
     ▼
-Supabase: agent_tasks
+Supabase: agent_tasks (Realtime ON)
     │
-    │ INSERT/UPDATE/DELETE events
+    ├─► INSERT event  ──► on_task_insert()  ──► claim → execute
+    ├─► UPDATE event  ──► on_task_update()  ──► claim if unblocked
+    ├─► DELETE event  ──► on_task_delete()  ──► log cancellation
+    │
+    │ Polling (every 30s) ──► catch missed events during reconnect
     ▼
-All Agents (Realtime subscription) ──► Primary: instant via Realtime
-    │                                     │
-    │ polling fallback (every 30s)        │ Fallback: if Realtime fails
-    ▼                                     ▼
-    ┌──────────────────────────────────────┐
-    │           Task Execution              │
-    │  claim → execute → result → Discord  │
-    └──────────────────────────────────────┘
+All Agents (both run together)
+    │
+    └─► result → Discord source_channel
+```
+
+**Both Realtime and polling run simultaneously.** Realtime delivers instant delivery; polling catches any events during reconnection windows. This is not a "fallback" — polling is a safety net that runs always.
+
+---
+
+## Version History
+
+| Version | Date | Key Changes |
+|---------|------|-------------|
+| v6.0.0 | 2026-05-27 | Realtime + polling both active, canonical worker template, blocked_by UPDATE handler |
+| v5.0.0 | 2026-05-18 | Source channel tracking, heartbeat |
+| v4.0.0 | 2026-05-15 | Unblock mechanism, heartbeat table |
+| v3.0.0 | 2026-05-10 | Multi-agent via Supabase |
+
+---
+
+## Setup Prerequisites
+
+Run these in Supabase SQL Editor before deploying any agent worker.
+
+### 1. Create Tables
+
+```sql
+-- agent_tasks: the shared task queue
+CREATE TABLE IF NOT EXISTS agent_tasks (
+  id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+  task_id TEXT NOT NULL UNIQUE,
+  agent_name TEXT,                          -- creator (usually zeanna)
+  assigned_to TEXT,                         -- agent currently handling
+  status TEXT DEFAULT 'pending' CHECK (status IN (
+    'pending','claimed','running','done','error','blocked'
+  )),
+  task_type TEXT NOT NULL CHECK (task_type IN (
+    'research','code','image','video','file','deploy','setup','general'
+  )),
+  instruction TEXT NOT NULL,
+  payload JSONB,
+  priority INT DEFAULT 5,                   -- 1=critical, 5=normal, 10=low
+  result TEXT,
+  result_data JSONB,
+  error_message TEXT,
+  retry_count INT DEFAULT 0,
+  max_retries INT DEFAULT 3,
+  blocked_by TEXT,                          -- task_id of prerequisite task
+  source_channel TEXT NOT NULL,             -- 'discord:CHANNEL_ID'
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  claimed_at TIMESTAMPTZ,
+  completed_at TIMESTAMPTZ
+);
+
+-- agent_heartbeats: agent health + version tracking
+CREATE TABLE IF NOT EXISTS agent_heartbeats (
+  agent_name TEXT PRIMARY KEY,
+  status TEXT DEFAULT 'idle' CHECK (status IN ('idle','busy')),
+  current_task_id UUID,
+  last_seen TIMESTAMPTZ DEFAULT NOW(),
+  skill_version TEXT,
+  capabilities TEXT[]
+);
+```
+
+### 2. Enable Realtime on agent_tasks
+
+```sql
+-- In Supabase dashboard: Database → Replication → agent_tasks
+-- OR run:
+ALTER PUBLICATION supabase_realtime ADD TABLE agent_tasks;
+```
+
+### 3. Register Agent Heartbeat
+
+```sql
+-- Register each agent. Run once per agent machine.
+INSERT INTO agent_heartbeats (agent_name, status, capabilities, skill_version, last_seen)
+VALUES
+  ('mr-kim', 'idle', ARRAY['research','code'], 'v6.0.0', NOW()),
+  ('zenoa',  'idle', ARRAY['file','code','deploy'], 'v6.0.0', NOW()),
+  ('miss-x', 'idle', ARRAY['image','video','code'], 'v6.0.0', NOW())
+ON CONFLICT (agent_name) DO UPDATE SET
+  skill_version = EXCLUDED.skill_version,
+  capabilities = EXCLUDED.capabilities,
+  last_seen = NOW();
+```
+
+### 4. Verify Setup
+
+```sql
+SELECT agent_name, status, skill_version, last_seen FROM agent_heartbeats;
+```
+
+Expected: `skill_version = v6.0.0` for all registered agents.
+
+---
+
+## Canonical Worker
+
+**Only one worker template:** `scripts/worker_template.py`
+
+All agents use this same file. Configure via environment variables — no file edits needed per agent.
+
+```bash
+# Minimal env for worker
+export SUPABASE_URL="https://lyhhfqbkwamodswxewql.supabase.co"
+export SUPABASE_KEY="<from .env>"
+export AGENT_NAME="mr-kim"           # change per agent
+export AGENT_CAPABILITIES="research,code,general"
+export SKILL_VERSION="v6.0.0"
+export POLL_INTERVAL="30"
+
+python3 scripts/worker_template.py
 ```
 
 ---
 
-## Tables Schema
+## How Tasks Flow
 
-### agent_tasks
+### Zeanna Creates Task
 
-| Column | Type | Required | Notes |
-|--------|------|----------|-------|
-| id | uuid | ✅ | PK, auto-generated |
-| task_id | text | ✅ | Human-readable ID, e.g. `markdown-renderer-001` |
-| agent_name | text | | Original creator (zeanna) |
-| assigned_to | text | | Agent currently handling |
-| status | text | ✅ | `pending` `claimed` `running` `done` `error` `blocked` |
-| task_type | text | ✅ | `research` `code` `image` `video` `file` `deploy` `setup` `general` |
-| instruction | text | ✅ | Full task description (Markdown OK) |
-| payload | jsonb | | Additional context: `{repo, depth, etc}` |
-| priority | int | | 1=critical, 5=normal, 10=low. Default 5 |
-| result | text | | Output/error message |
-| result_data | jsonb | | Structured result: `{url, files, etc}` |
-| error_message | text | | Error details |
-| retry_count | int | | Current retry #. Default 0 |
-| max_retries | int | | Hard limit. Default 3 |
-| blocked_by | text | | task_id of blocking prerequisite |
-| source_channel | text | ✅ | Origin channel: `discord:1497264979160727724` |
-| created_at | timestamptz | ✅ | Auto |
-| updated_at | timestamptz | | Auto on update |
-| claimed_at | timestamptz | | When agent claimed |
-| completed_at | timestamptz | | When done/error |
-
-### agent_heartbeats
-
-| Column | Type | Required | Notes |
-|--------|------|----------|-------|
-| agent_name | text | ✅ | PK, e.g. `mr-kim` |
-| status | text | ✅ | `idle` `busy` |
-| current_task_id | uuid | | FK to agent_tasks.id |
-| last_seen | timestamptz | ✅ | Last poll/heartbeat |
-| skill_version | text | | e.g. `v6.0.0` — set by agent on startup |
-| capabilities | text[] | | What this agent can handle |
-
----
-
-## Task Lifecycle
-
-```
-pending → claimed → running → done
-                    ↘ error → (retry logic)
-pending → blocked (waiting on prerequisite)
+```python
+supabase.table("agent_tasks").insert({
+    "task_id": "my-task-001",
+    "task_type": "code",
+    "instruction": "Fix the login bug in https://github.com/owner/repo",
+    "payload": {"repo": "https://github.com/owner/repo"},
+    "priority": 3,
+    "source_channel": "discord:1497264979160727724"
+}).execute()
 ```
 
-### Status Meanings
+### INSERT Event → Agent Claims Instantly
 
-| Status | Who Sets | Meaning |
-|--------|----------|---------|
-| `pending` | Zeanna | Ready for agent to claim |
-| `claimed` | Agent | Agent picked it up, executing soon |
-| `running` | Agent | Actively working |
-| `done` | Agent | Completed successfully |
-| `error` | Agent | Failed (may retry) |
-| `blocked` | Agent or Zeanna | Waiting on prerequisite |
+Realtime fires `on_task_insert()` → agent checks:
+1. `is_agent_idle()` — heartbeat says I'm free
+2. `blocked_by` is null — no prerequisite blocking me
+3. `task_type` in MY_CAPABILITIES — I can handle this
+4. `assigned_to` is null or me — not already claimed
 
----
+If all pass → `claim_task()` (atomic UPDATE WHERE status='pending') → `execute_task()` → result posted to `source_channel`.
 
-## Event Types (Realtime + Polling)
+### UPDATE Event → Agent Re-claims When Unblocked
 
-Agents listen for all three Supabase events:
+When prerequisite completes, Zeanna clears `blocked_by`:
 
-| Event | Trigger | Agent Response |
-|-------|---------|----------------|
-| `INSERT` | New task created | Check if can handle → claim → execute |
-| `UPDATE` | Task unblocked or reassigned | Check blocked_by cleared → claim if unclaimed |
-| `DELETE` | Task cancelled | Stop processing if we claimed it |
+```python
+supabase.table("agent_tasks").update({
+    "status": "pending",
+    "blocked_by": None
+}).eq("id", task_id).execute()
+```
 
-### Priority Rules
+Realtime fires `on_task_update()` → detects `blocked_by` was cleared → attempts claim immediately.
 
-When multiple tasks available:
-1. Highest priority number first (1=critical)
-2. Among same priority: oldest created_at first (FIFO)
+### Polling Catches Reconnection Gaps
+
+If Realtime disconnects (network blip), `on_task_update()` won't fire during the gap. The polling thread wakes every 30s and claims any newly unblocked or new tasks the Realtime missed. Both run together.
 
 ---
 
-## Generic Task Handlers
+## Task Handlers
 
-All agents implement this standard handler map:
+Standard handler signature — all agents implement this map:
 
 ```python
 TASK_HANDLERS = {
-    "research":   execute_research,
-    "code":       execute_code,
-    "image":      execute_image,
-    "video":      execute_video,
-    "file":       execute_file,
-    "deploy":     execute_deploy,
-    "setup":      execute_setup,
-    "general":    execute_general,
+    "research": execute_research,
+    "code":     execute_code,
+    "image":    execute_image,
+    "video":    execute_video,
+    "file":     execute_file,
+    "deploy":   execute_deploy,
+    "setup":    execute_setup,
+    "general":  execute_general,   # fallback for unknown types
 }
 
 def execute_task(task: dict) -> dict:
-    """Standard task executor — route to handler by task_type."""
-    task_type = task.get("task_type", "general")
+    task_type  = task.get("task_type", "general")
     instruction = task.get("instruction", "")
-    payload = task.get("payload", {})
-
-    handler = TASK_HANDLERS.get(task_type, execute_general)
+    payload     = task.get("payload", {}) or {}
+    handler     = TASK_HANDLERS.get(task_type, execute_general)
     return handler(instruction, payload)
 ```
 
-### Required Handler Signature
+### Handler Signature
 
 ```python
 def handler(instruction: str, payload: dict) -> dict:
     """
     Returns:
         {
-            "status": "done" | "error",
-            "result": str,           # Human-readable output
-            "result_data": dict | None  # Structured data: URLs, files, etc.
+            "status":     "done" | "error",
+            "result":     str,       # Human-readable output
+            "result_data": dict | None  # Structured: URLs, files, etc.
         }
     """
 ```
 
 ---
 
-## Claim Protocol (Atomic)
-
-### Step 1 — Verify can claim
-
-```python
-def can_claim_task(task: dict, agent_caps: list[str]) -> bool:
-    return (
-        task["status"] == "pending"
-        and task.get("retry_count", 0) < task.get("max_retries", 3)
-        and (task.get("assigned_to") is None or task.get("assigned_to") == MY_NAME)
-        and task.get("blocked_by") is None
-        and task["task_type"] in agent_caps
-    )
-```
-
-### Step 2 — Atomic Claim
+## Atomic Claim Protocol
 
 ```python
 def claim_task(task_id: str) -> bool:
-    """Atomic claim — only succeeds if status still pending."""
+    """Atomically claim — only succeeds if status still pending."""
     result = supabase.table("agent_tasks").update({
         "status": "claimed",
-        "assigned_to": MY_NAME,
-        "claimed_at": "now()"
+        "assigned_to": AGENT_NAME,
+        "claimed_at": datetime.utcnow().isoformat()
     }).eq("id", task_id).eq("status", "pending").execute()
     return len(result.data) > 0
 ```
 
-### Step 3 — On Failure
-
-If claim fails (race condition) → skip, task went to another agent.
+**Rule:** Never UPDATE without `WHERE status='pending'`. If another agent claimed first, our UPDATE returns 0 rows → `claim_task()` returns False → we skip.
 
 ---
 
@@ -208,31 +257,14 @@ Before claiming ANY task:
 
 ```python
 def is_agent_idle() -> bool:
-    hb = supabase.table("agent_heartbeats").select("*").eq("agent_name", MY_NAME).single().execute()
+    hb = supabase.table("agent_heartbeats").select("status","current_task_id")\
+           .eq("agent_name", MY_NAME).single().execute()
     if not hb.data:
-        return True  # New agent, no record yet
-    record = hb.data
-    return record["status"] == "idle" and record.get("current_task_id") is None
+        return True   # New agent, no record yet
+    return hb.data["status"] == "idle" and hb.data.get("current_task_id") is None
 ```
 
-**Only claim if `is_idle() == True`.** If busy, skip this cycle.
-
----
-
-## Discord Notifications
-
-### Rule: Post to `source_channel` on all events
-
-| Event | Emoji | Example |
-|-------|-------|---------|
-| Claim | 🎯 | `🎯 {AGENT} claimed {task_id}` |
-| Start | ⏳ | `⏳ {AGENT} working on {task_id}` |
-| Progress | 🧵 | `🧵 {AGENT}: {update}` |
-| Done | ✅ | `✅ {AGENT} completed {task_id}` |
-| Error | 🔴 | `🔴 {AGENT} error on {task_id}: {error}` |
-| Blocked | 🔒 | `🔒 {AGENT} blocked on {task_id}: {reason}` |
-
-**Source channel** comes from `task["source_channel"]` (e.g. `discord:1497264979160727724`).
+**Only claim if `is_agent_idle() == True`.** If busy, skip — another task is already in progress.
 
 ---
 
@@ -243,13 +275,12 @@ def is_agent_idle() -> bool:
 ```python
 supabase.table("agent_tasks").update({
     "status": "blocked",
-    "blocked_by": prerequisite_task_id
+    "blocked_by": "some-prerequisite-task-id"
 }).eq("id", task_id).execute()
 ```
 
-### Unblock
+### Unblock (when prerequisite done)
 
-When prerequisite completes:
 ```python
 supabase.table("agent_tasks").update({
     "status": "pending",
@@ -257,76 +288,124 @@ supabase.table("agent_tasks").update({
 }).eq("id", task_id).execute()
 ```
 
-Agent watching via Realtime `UPDATE` event will see `blocked_by` cleared and can claim.
+The `on_task_update()` Realtime handler fires on this UPDATE → detects `blocked_by` cleared → claims immediately.
+
+---
+
+## Discord Notifications
+
+Post to `source_channel` on every event:
+
+| Status | Emoji | Message |
+|--------|-------|---------|
+| claimed | 🎯 | `🎯 {AGENT} claimed {task_id}` |
+| running | ⏳ | `⏳ {AGENT} working on {task_id}` |
+| done | ✅ | `✅ {AGENT} completed {task_id}: {result}` |
+| error | 🔴 | `🔴 {AGENT} error on {task_id}: {message}` |
+| retry | 🔁 | `🔁 {AGENT} retry {n}/{max_retries}: {reason}` |
+
+`source_channel` format: `discord:CHANNEL_ID` (e.g. `discord:1497264979160727724`).
+Working Agent thread for coordination: `1504502974632820787`.
 
 ---
 
 ## Environment Variables
 
-Agents MUST have these set:
+**Required** — no hardcoded secrets:
 
 ```bash
 SUPABASE_URL=https://lyhhfqbkwamodswxewql.supabase.co
 SUPABASE_KEY=<from .env — NOT hardcoded>
-AGENT_NAME=mr-kim          # or zenoa, miss-x
-DISCORD_BOT_TOKEN=<from .env — NOT hardcoded>
-GITHUB_TOKEN=<for code tasks — NOT hardcoded>
-SKILL_VERSION=v6.0.0       # reported to heartbeat on startup
+AGENT_NAME=mr-kim              # or zenoa, miss-x
+AGENT_CAPABILITIES=research,code,general
+SKILL_VERSION=v6.0.0
+POLL_INTERVAL=30               # seconds between poll cycles
+DISCORD_BOT_TOKEN=<from .env>
+GITHUB_TOKEN=<for code/deploy tasks — from .env>
 ```
 
 ---
 
-## Supabase Realtime Subscription
+## End-to-End Deploy Checklist
 
-### Primary Mode (Realtime)
+For a new agent machine, in order:
 
-```python
-def subscribe_to_tasks():
-    """Listen for INSERT/UPDATE/DELETE on agent_tasks."""
-    supabase.channel("agent_tasks")
-        .on("postgres_changes",
-            {"event": "INSERT", "schema": "public", "table": "agent_tasks"},
-            on_task_insert)
-        .on("postgres_changes",
-            {"event": "UPDATE", "schema": "public", "table": "agent_tasks"},
-            on_task_update)
-        .on("postgres_changes",
-            {"event": "DELETE", "schema": "public", "table": "agent_tasks"},
-            on_task_delete)
-        .subscribe()
+**Step 1 — Supabase setup (once per project)**
+```sql
+-- Run in SQL Editor (see Setup Prerequisites above)
 ```
 
-### Fallback Mode (Polling)
-
-If Realtime connection fails, fall back to polling:
-
-```python
-POLL_INTERVAL = 30  # seconds
-while True:
-    if not realtime_connected:
-        tasks = supabase.table("agent_tasks").select("*")\
-            .eq("status", "pending")\
-            .not_.is_("blocked_by", "not_is", None)\
-            .in_("task_type", MY_CAPABILITIES)\
-            .order("priority", desc=True)\
-            .order("created_at")\
-            .limit(5).execute()
-        for task in tasks.data:
-            process(task)
-    time.sleep(POLL_INTERVAL)
+**Step 2 — Clone the framework**
+```bash
+git clone https://github.com/GanzApps/ganz-agent-skills.git
+cd ganz-agent-skills/skills/agent-orchestrator/agent-ops-framework
 ```
+
+**Step 3 — Register heartbeat**
+```sql
+-- Run INSERT (see Setup Prerequisites step 3)
+```
+
+**Step 4 — Configure env**
+```bash
+export SUPABASE_URL="https://lyhhfqbkwamodswxewql.supabase.co"
+export SUPABASE_KEY="<key from .env>"
+export AGENT_NAME="mr-kim"
+export AGENT_CAPABILITIES="research,code"
+export SKILL_VERSION="v6.0.0"
+```
+
+**Step 5 — Test locally**
+```bash
+python3 scripts/worker_template.py
+# Worker should log: "Agent worker starting — mr-kim v6.0.0"
+# Should log: "Realtime subscription active"
+```
+
+**Step 6 — Configure systemd** (Linux only)
+```ini
+[Unit]
+Description=Zeanna Agent Worker (%i)
+After=network-online.target
+
+[Service]
+Type=simple
+User=root
+EnvironmentFile=/root/.openclaw/workspace/.env
+WorkingDirectory=/root/.openclaw/workspace/skills/agent-ops-framework
+ExecStart=/usr/bin/python3 scripts/worker_template.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable agent-worker@mr-kim
+sudo systemctl start agent-worker@mr-kim
+sudo journalctl -u agent-worker@mr-kim -f  # verify it's running
+```
+
+**Step 7 — Verify**
+```sql
+SELECT agent_name, status, skill_version, last_seen
+FROM agent_heartbeats
+WHERE agent_name = 'mr-kim';
+```
+Expected: `status = idle`, `skill_version = v6.0.0`, `last_seen` within 1 minute.
 
 ---
 
 ## Safety Rules
 
-1. **Atomic claim only** — never UPDATE without WHERE status='pending'
-2. **Heartbeat gate** — only claim when idle
-3. **Max retries = 3** — hard limit, after that task goes to error
-4. **blockers first** — check `blocked_by` before claiming
-5. **Post all events to source_channel** — claim/start/done/error/blocked
-6. **Graceful shutdown** — on SIGTERM, mark current task as pending for re-claim
-7. **Skill version** — report `skill_version=v6.0.0` to heartbeat on startup
+1. **Atomic claim only** — never UPDATE without `WHERE status='pending'`
+2. **Heartbeat gate** — only claim when `is_agent_idle() == True`
+3. **Max retries = 3** — hard limit; after that task goes to `error`
+4. **blocked_by first** — skip any task with a non-null `blocked_by`
+5. **Graceful shutdown** — on SIGTERM, mark current task `pending` for re-claim
+6. **Realtime + polling both active** — polling is not optional, it catches reconnect gaps
+7. **skill_version in heartbeat** — every agent reports `v6.0.0` on startup
 
 ---
 
@@ -336,22 +415,17 @@ while True:
 agent-ops-framework/
 ├── SKILL.md                      ← This file (v6.0.0)
 ├── CHANGELOG.md                  ← Version history
-├── VERSION.md                    ← Current version marker
+├── VERSION.md                    ← Version marker (v6.0.0)
 ├── docs/
 │   ├── SETUP_QUICK.md            ← 5-min setup guide
-│   └── SETUP_FULL.md             ← Detailed installation
-├── scripts/
-│   ├── worker_template.py        ← Ready-to-run worker (generic)
-│   ├── self_update.sh            ← Pull latest from GitHub
-│   └── heartbeat_ping.sh         ← Keepalive ping
-└── examples/
-    ├── mr-kim-worker.py         ← Mr. Kim config
-    ├── zenoa-worker.py           ← ZenoA config
-    └── miss-x-worker.py          ← Miss X config
+│   └── SETUP_FULL.md             ← Detailed installation guide
+└── scripts/
+    ├── worker_template.py        ← Canonical worker (all agents use this)
+    └── self_update.sh            ← Pull latest from GitHub (cron: hourly)
 ```
 
 ---
 
-## Questions / Comments
+## Questions / Issues
 
-→ Open an issue on https://github.com/GanzApps/ganz-agent-skills
+→ Comment on https://github.com/GanzApps/ganz-agent-skills/pull/1

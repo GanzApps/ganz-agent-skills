@@ -1,63 +1,58 @@
 #!/usr/bin/env bash
 # self_update.sh — Pull latest agent-ops-framework from GitHub
 # Run via cron: 0 * * * * /path/to/self_update.sh
+# No R2, no tarball — GitHub only.
 
 set -e
 
 AGENT_NAME="${AGENT_NAME:-zeanna}"
 SKILL_DIR="${SKILL_DIR:-/root/.openclaw/workspace/skills/agent-ops-framework}"
 GITHUB_REPO="https://github.com/GanzApps/ganz-agent-skills"
-GITHUB_BRANCH="refs/heads/main"
 LOG_FILE="/tmp/agent-update.log"
 
-echo "[$(date)] Agent self-update starting for $AGENT_NAME" >> "$LOG_FILE"
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"; }
 
-# Check if git is available
+log "Self-update starting for $AGENT_NAME"
+
+# git required
 if ! command -v git &> /dev/null; then
-    echo "[$(date)] git not found, skipping" >> "$LOG_FILE"
+    log "git not found, skipping"
     exit 0
 fi
 
-# Navigate to skill dir
 mkdir -p "$SKILL_DIR"
 cd "$SKILL_DIR"
 
-# If not a git repo, clone fresh
+# Fresh clone if not a git repo (first run)
 if [ ! -d ".git" ]; then
-    echo "[$(date)] Fresh clone of $GITHUB_REPO" >> "$LOG_FILE"
+    log "Fresh clone of $GITHUB_REPO"
     git clone "$GITHUB_REPO" .
 fi
 
-# Fetch latest
-echo "[$(date)] Fetching latest from $GITHUB_REPO" >> "$LOG_FILE"
-git fetch origin
-
-# Check if we're behind
+# Fetch + reset (discard local changes — this is a clean deployment dir)
+log "Fetching latest..."
+git fetch origin main
 LOCAL=$(git rev-parse HEAD)
 REMOTE=$(git rev-parse origin/main)
+
 if [ "$LOCAL" = "$REMOTE" ]; then
-    echo "[$(date)] Already up to date" >> "$LOG_FILE"
+    log "Already up to date at $(git rev-parse --short HEAD)"
     exit 0
 fi
 
-echo "[$(date)] Updating from $LOCAL → $REMOTE" >> "$LOG_FILE"
-git checkout origin/main
+log "Updating: $(git rev-parse --short HEAD) → $(git rev-parse --short origin/main)"
+git reset --hard origin/main
 
-# Update agent name in worker if needed
-if [ "$AGENT_NAME" != "zeanna" ]; then
-    sed -i "s/AGENT_NAME = .*/AGENT_NAME = \"$AGENT_NAME\"/" scripts/worker_template.py 2>/dev/null || true
-    sed -i "s/AGENT_NAME=.*/AGENT_NAME=$AGENT_NAME/" .env 2>/dev/null || true
-fi
-
-# Restart worker if running
-WORKER_PID=$(pgrep -f "worker_template.py" || true)
+# Update AGENT_NAME in worker via env substitution (don't hardcode sed)
+# Worker reads from env, so nothing to patch in the file itself.
+# Only restart worker if it's running.
+WORKER_PID=$(pgrep -f "worker_template.py" 2>/dev/null || true)
 if [ -n "$WORKER_PID" ]; then
-    echo "[$(date)] Restarting worker (PID: $WORKER_PID)..." >> "$LOG_FILE"
+    log "Restarting worker (PID: $WORKER_PID)..."
     pkill -f "worker_template.py"
     sleep 2
-    cd "$SKILL_DIR"
     nohup python3 scripts/worker_template.py >> "$LOG_FILE" 2>&1 &
-    echo "[$(date)] Worker restarted" >> "$LOG_FILE"
+    log "Worker restarted"
 fi
 
-echo "[$(date)] Update complete — now on $(git rev-parse --short HEAD)" >> "$LOG_FILE"
+log "Update complete — now on $(git rev-parse --short HEAD)"
