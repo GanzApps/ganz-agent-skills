@@ -1,328 +1,442 @@
 #!/usr/bin/env python3
 """
-Agent Worker Template
-Multi-agent task consumer for Supabase shared queue.
-Copy this file and configure for your agent.
+Agent Worker Template v6.0.0
+Generic multi-agent task framework with Realtime + polling fallback.
+
+Copy this file, configure AGENT_* vars, and run.
+Reads secrets from environment — NO hardcoded values.
 """
 
 import os
+import sys
 import time
 import json
+import signal
+import threading
 from datetime import datetime
-from supabase import create_client, Client
+from typing import Optional
 
-# ─── CONFIG ───
+# ─── CONFIG (override via env) ───────────────────────────────────────────
 SUPABASE_URL = os.getenv("SUPABASE_URL", "https://lyhhfqbkwamodswxewql.supabase.co")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
-AGENT_NAME = os.getenv("AGENT_NAME", "mr-kim")  # Change this per agent
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")           # from .env
+AGENT_NAME = os.getenv("AGENT_NAME", "agent")           # mr-kim, zenoa, miss-x
+AGENT_CAPABILITIES = os.getenv("AGENT_CAPABILITIES", "research,code,general").split(",")
+SKILL_VERSION = os.getenv("SKILL_VERSION", "v6.0.0")
 
-# What this agent can do
-AGENT_CAPABILITIES = [
-    "research",
-    "code",
-    # "image",      # Uncomment if agent can do images
-    # "video",      # Uncomment if agent can do video
-    # "file",       # Uncomment if agent can do file ops
-]
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "30"))   # seconds
 
-# Polling interval (seconds)
-POLL_INTERVAL = 30
+MY_CAPABILITIES = [c.strip() for c in AGENT_CAPABILITIES]
+# ─────────────────────────────────────────────────────────────────────────
 
-# ─── SETUP ───
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-def update_heartbeat(status="idle", current_task_id=None):
+if not SUPABASE_KEY:
+    raise SystemExit("SUPABASE_KEY env var required")
+
+from supabase import create_client
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# ─── STATE ───────────────────────────────────────────────────────────────
+realtime_connected = False
+current_task_id = None
+shutdown_requested = False
+
+# ─── LOGGING ─────────────────────────────────────────────────────────────
+def log(msg: str, level: str = "INFO"):
+    ts = datetime.now().strftime("%H:%M:%S")
+    print(f"[{ts}] [{AGENT_NAME}] [{level}] {msg}", flush=True)
+
+def log_error(msg: str):
+    log(msg, "ERROR")
+
+def log_warn(msg: str):
+    log(msg, "WARN")
+
+# ─── HEARTBEAT ────────────────────────────────────────────────────────────
+def update_heartbeat(status: str = "idle", current_task: str = None):
     """Update agent heartbeat in Supabase."""
     try:
         supabase.table("agent_heartbeats").upsert({
             "agent_name": AGENT_NAME,
             "status": status,
-            "current_task_id": current_task_id,
+            "current_task_id": current_task,
             "last_seen": datetime.utcnow().isoformat(),
-            "capabilities": AGENT_CAPABILITIES
-        }).execute()
+            "skill_version": SKILL_VERSION,
+            "capabilities": MY_CAPABILITIES
+        }, on_conflict="agent_name").execute()
     except Exception as e:
-        log(f"Heartbeat failed: {e}")
+        log_warn(f"Heartbeat failed: {e}")
 
-
-
-
-
-def log(msg: str):
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] [{AGENT_NAME}] {msg}")
-
-
-def get_pending_tasks():
-    """Fetch claimable tasks this agent can handle.
-    
-    Fetches all pending tasks where this agent is named OR assigned.
-    Capability check happens in process_task() before claim/reject.
-    """
+def is_agent_idle() -> bool:
+    """True only if agent is idle (no current task)."""
     try:
-        response = supabase.table("agent_tasks") \
-            .select("*") \
-            .eq("status", "pending") \
-            .lt("retry_count", "max_retries") \
-            .or_(f"agent_name.eq.{AGENT_NAME},assigned_to.eq.{AGENT_NAME}") \
-            .gt("created_at", (datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)).isoformat()) \
-            .order("priority", desc=True) \
-            .order("created_at", desc=False) \
-            .limit(5) \
-        .execute()
-        return response.data or []
+        result = supabase.table("agent_heartbeats").select(
+            "status", "current_task_id"
+        ).eq("agent_name", AGENT_NAME).single().execute()
+        if not result.data:
+            return True
+        return result.data["status"] == "idle" and result.data.get("current_task_id") is None
+    except Exception:
+        return True  # Treat no record as idle
+
+# ─── TASK QUERY ─────────────────────────────────────────────────────────
+def get_claimable_tasks() -> list[dict]:
+    """Get pending tasks this agent can handle. Respects blocked_by."""
+    try:
+        result = supabase.table("agent_tasks").select("*").eq(
+            "status", "pending"
+        ).in_(
+            "task_type", MY_CAPABILITIES
+        ).or_(
+            f"assigned_to.is.null,assigned_to.eq.{AGENT_NAME}"
+        ).order(
+            "priority", desc=True
+        ).order(
+            "created_at"
+        ).limit(5).execute()
+        tasks = result.data or []
+        # Filter out blocked tasks
+        return [t for t in tasks if not t.get("blocked_by")]
     except Exception as e:
-        log(f"Failed to fetch tasks: {e}")
+        log_error(f"get_claimable_tasks failed: {e}")
         return []
 
-
+# ─── ATOMIC CLAIM ────────────────────────────────────────────────────────
 def claim_task(task_id: str) -> bool:
-    """Atomically claim a task. Returns True if successful.
-    
-    Safety: only claim if pending + not maxed retries + not already claimed
-    """
+    """Atomic claim — only succeeds if status still pending."""
     try:
-        # Double-check task is still claimable before claiming
-        check = supabase.table("agent_tasks") \
-            .select("status, retry_count, max_retries") \
-            .eq("id", task_id) \
-            .single() \
-            .execute()
-        
-        if not check.data:
-            log(f"Task {task_id} not found")
-            return False
-            
-        task = check.data
-        if task["status"] != "pending":
-            log(f"Task {task_id} not pending (status: {task['status']})")
-            return False
-            
-        if task["retry_count"] >= task["max_retries"]:
-            log(f"Task {task_id} max retries exceeded")
-            return False
-        
-        # Atomic claim
-        response = supabase.table("agent_tasks") \
-            .update({
-                "status": "claimed",
-                "assigned_to": AGENT_NAME,
-                "claimed_at": datetime.utcnow().isoformat()
-            }) \
-            .eq("id", task_id) \
-            .eq("status", "pending") \
-            .execute()
-        return len(response.data) > 0
+        result = supabase.table("agent_tasks").update({
+            "status": "claimed",
+            "assigned_to": AGENT_NAME,
+            "claimed_at": datetime.utcnow().isoformat()
+        }).eq("id", task_id).eq("status", "pending").execute()
+        return len(result.data) > 0
     except Exception as e:
-        log(f"Failed to claim task: {e}")
+        log_error(f"claim_task failed: {e}")
         return False
 
-
-def update_task_status(task_id: str, status: str, result: str = None, result_data: dict = None):
-    """Update task status and optionally result."""
-    update = {"status": status, "updated_at": datetime.utcnow().isoformat()}
+# ─── TASK STATUS UPDATE ──────────────────────────────────────────────────
+def update_task(task_id: str, status: str, result: str = None,
+                result_data: dict = None, error: str = None):
+    """Update task status and result."""
+    update = {
+        "status": status,
+        "updated_at": datetime.utcnow().isoformat()
+    }
     if result:
         update["result"] = result
     if result_data:
         update["result_data"] = result_data
+    if error:
+        update["error_message"] = error
     if status in ("done", "error"):
         update["completed_at"] = datetime.utcnow().isoformat()
-    
-    supabase.table("agent_tasks").update(update).eq("id", task_id).execute()
 
+    try:
+        supabase.table("agent_tasks").update(update).eq("id", task_id).execute()
+    except Exception as e:
+        log_error(f"update_task failed: {e}")
 
-def execute_task(task: dict) -> dict:
-    """
-    Execute the task. Override this for your agent's capabilities.
-    Returns: {"status": "done|error", "result": str, "result_data": dict}
-    """
-    task_type = task.get("task_type", "general")
-    instruction = task.get("instruction", "")
-    payload = task.get("payload", {})
-    
-    log(f"Executing: {instruction}")
-    
-    # ─── TASK ROUTING ───
-    if task_type not in AGENT_CAPABILITIES:
-        return {
-            "status": "rejected",
-            "result": f"Task type '{task_type}' not in agent capabilities {AGENT_CAPABILITIES}",
-            "result_data": {}
-        }
-    if task_type == "research":
-        return execute_research(instruction, payload)
-    elif task_type == "code":
-        return execute_code(instruction, payload)
-    else:
-        return {
-            "status": "error",
-            "result": f"Unknown task type: {task_type}",
-            "result_data": {}
-        }
-
+# ─── TASK EXECUTION ──────────────────────────────────────────────────────
+# Standard handler signature:
+#   handler(instruction: str, payload: dict) -> {"status": str, "result": str, "result_data": dict}
 
 def execute_research(instruction: str, payload: dict) -> dict:
-    """Example research task handler."""
-    # TODO: Implement actual research logic
-    # For now, return a placeholder
-    return {
-        "status": "done",
-        "result": f"Research completed for: {instruction}",
-        "result_data": {
-            "topic": payload.get("topic", ""),
-            "findings": ["Finding 1", "Finding 2"],
-            "sources": []
-        }
-    }
-
+    """Web research task handler. Implement with Tavily/Brave Search."""
+    # TODO: Implement actual research
+    return {"status": "done", "result": f"Research complete: {instruction[:50]}", "result_data": {"topic": payload.get("topic", "")}}
 
 def execute_code(instruction: str, payload: dict) -> dict:
-    """Example code task handler."""
+    """Code generation/review task handler."""
     # TODO: Implement actual code generation
-    return {
-        "status": "done",
-        "result": f"Code generated for: {instruction}",
-        "result_data": {
-            "language": payload.get("language", "python"),
-            "code": "# TODO: Generated code here"
-        }
-    }
+    return {"status": "done", "result": f"Code generated: {instruction[:50]}", "result_data": {"repo": payload.get("repo", "")}}
 
+def execute_image(instruction: str, payload: dict) -> dict:
+    """Image generation task handler."""
+    return {"status": "done", "result": f"Image generated: {instruction[:50]}", "result_data": {}}
 
-def post_discord_status(task_id: str, status: str, message: str):
-    """Post status update to Discord."""
-    # TODO: Implement Discord webhook/bot posting
-    # For now, just log
-    log(f"Discord [{status}]: {message}")
+def execute_video(instruction: str, payload: dict) -> dict:
+    """Video generation task handler."""
+    return {"status": "done", "result": f"Video generated: {instruction[:50]}", "result_data": {}}
 
+def execute_file(instruction: str, payload: dict) -> dict:
+    """File operations task handler."""
+    return {"status": "done", "result": f"File op complete: {instruction[:50]}", "result_data": {}}
 
-def reject_task(task_id: str, reason: str):
-    """Reject a task — capability or assignment mismatch.
-    Sets status=rejected so orchestrator knows this was inspected.
-    """
-    try:
-        supabase.table("agent_tasks").update({
+def execute_deploy(instruction: str, payload: dict) -> dict:
+    """Deployment task handler."""
+    return {"status": "done", "result": f"Deployed: {instruction[:50]}", "result_data": {}}
+
+def execute_setup(instruction: str, payload: dict) -> dict:
+    """Setup/prerequisite task handler."""
+    return {"status": "done", "result": f"Setup complete: {instruction[:50]}", "result_data": {}}
+
+def execute_general(instruction: str, payload: dict) -> dict:
+    """Fallback handler for unknown types."""
+    return {"status": "done", "result": f"Done: {instruction[:50]}", "result_data": {}}
+
+# Generic handler map
+TASK_HANDLERS = {
+    "research": execute_research,
+    "code": execute_code,
+    "image": execute_image,
+    "video": execute_video,
+    "file": execute_file,
+    "deploy": execute_deploy,
+    "setup": execute_setup,
+    "general": execute_general,
+}
+
+def execute_task(task: dict) -> dict:
+    """Route task to appropriate handler. Reject if type not in capabilities."""
+    task_type = task.get("task_type", "general")
+    instruction = task.get("instruction", "")
+    payload = task.get("payload", {}) or {}
+
+    # Reject if task_type not in capabilities (safety net after claim)
+    if task_type not in MY_CAPABILITIES:
+        return {
             "status": "rejected",
-            "error_message": reason,
-            "updated_at": datetime.utcnow().isoformat()
-        }).eq("id", task_id).execute()
-        log(f"Rejected task: {reason}")
-    except Exception as e:
-        log(f"Failed to reject task: {e}")
-    """Requeue a failed task for retry."""
-    try:
-        supabase.table("agent_tasks").update({
-            "status": "pending",
-            "retry_count": new_retry_count,
-            "error_message": error_msg,
-            "assigned_to": None,
-            "claimed_at": None,
-            "updated_at": datetime.utcnow().isoformat()
-        }).eq("id", task_id).execute()
-        log(f"Requeued task for retry {new_retry_count}")
-    except Exception as e:
-        log(f"Failed to requeue task: {e}")
+            "result": f"Task type '{task_type}' not in agent capabilities {MY_CAPABILITIES}",
+            "result_data": {}
+        }
 
+    handler = TASK_HANDLERS.get(task_type, execute_general)
+    return handler(instruction, payload)
 
+# ─── DISCORD NOTIFICATIONS ───────────────────────────────────────────────
+def parse_source_channel(source_channel: str) -> Optional[str]:
+    """Extract channel ID from source_channel string like 'discord:123456'."""
+    if not source_channel:
+        return None
+    parts = source_channel.split(":")
+    return parts[1] if len(parts) == 2 else source_channel
+
+def notify_discord(task_id: str, status: str, message: str, source_channel: str = None):
+    """Post notification to Discord source channel."""
+    # TODO: Implement actual Discord bot posting
+    # For now, just log
+    emoji = {"claimed": "🎯", "running": "⏳", "done": "✅", "error": "🔴", "blocked": "🔒"}.get(status, "📋")
+    log(f"Discord [{status}]: {emoji} {message}")
+
+# ─── PROCESS SINGLE TASK ──────────────────────────────────────────────────
 def process_task(task: dict):
-    """Process a single task end-to-end with retry logic."""
+    """Claim and execute a single task."""
+    global current_task_id
+
     task_id = task["id"]
-    task_name = task.get("task_id", "unknown")
+    task_identifier = task.get("task_id", task_id)
+    source_channel = task.get("source_channel")
     task_type = task.get("task_type", "general")
     max_retries = task.get("max_retries", 3)
     retry_count = task.get("retry_count", 0)
-    assigned_to = task.get("assigned_to") or task.get("agent_name")
-    
-    # Check if already failed too many times
-    if retry_count >= max_retries:
-        log(f"Task {task_name} exceeded max retries ({max_retries}), skipping")
-        post_discord_status(task_name, "error", f"❌ {AGENT_NAME} skipping #{task_name}: max retries exceeded")
+
+    # Check idle
+    if not is_agent_idle():
+        log(f"Agent busy, skipping {task_identifier}")
         return
-    
-    # If pre-assigned to this agent, verify capability match first
-    if assigned_to == AGENT_NAME and task_type not in AGENT_CAPABILITIES:
-        log(f"Task {task_name} assigned to me but type '{task_type}' not in my capabilities {AGENT_CAPABILITIES} — rejecting")
-        reject_task(task_id, f"capability mismatch: task_type='{task_type}' not in agent capabilities {AGENT_CAPABILITIES}")
-        post_discord_status(task_name, "rejected", f"🚫 {AGENT_NAME} rejected #{task_name}: type '{task_type}' not supported")
-        return
-    
-    # If task is unassigned, also check capability match before claiming
-    if not assigned_to and task_type not in AGENT_CAPABILITIES:
-        log(f"Task {task_name} has type '{task_type}' not in my capabilities {AGENT_CAPABILITIES} — rejecting")
-        reject_task(task_id, f"capability mismatch: unassigned task_type='{task_type}' not in agent capabilities {AGENT_CAPABILITIES}")
-        post_discord_status(task_name, "rejected", f"🚫 {AGENT_NAME} rejected #{task_name}: type '{task_type}' not supported")
-        return
-    
-    # 1. Claim
+
+    # Attempt claim
     if not claim_task(task_id):
-        log(f"Failed to claim task {task_name} (race condition)")
+        log(f"Claim failed (race), skipping {task_identifier}")
         return
-    
-    log(f"Claimed task: {task_name}")
+
+    log(f"Claimed: {task_identifier}")
+    current_task_id = task_id
     update_heartbeat("busy", task_id)
-    post_discord_status(task_name, "claimed", f"🔧 {AGENT_NAME} claimed task #{task_name}")
-    
-    # 2. Mark running
-    update_task_status(task_id, "running")
-    post_discord_status(task_name, "running", f"⏳ {AGENT_NAME} working on #{task_name}")
-    
+    notify_discord(task_identifier, "claimed", f"{AGENT_NAME} claimed {task_identifier}", source_channel)
+
+    # Mark running
+    update_task(task_id, "running")
+    notify_discord(task_identifier, "running", f"{AGENT_NAME} working on {task_identifier}", source_channel)
+
     try:
-        # 3. Execute
         result = execute_task(task)
-        
-        # 4. Store result
-        update_task_status(
-            task_id,
-            result["status"],
-            result.get("result"),
-            result.get("result_data")
-        )
-        
-        if result["status"] == "done":
-            log(f"Completed task: {task_name}")
-            update_heartbeat("idle", None)
-            post_discord_status(task_name, "done", f"✅ {AGENT_NAME} completed #{task_name}")
-        else:
-            # Task failed but retryable
-            log(f"Task failed: {task_name}, retry {retry_count + 1}/{max_retries}")
-            post_discord_status(task_name, "error", f"❌ {AGENT_NAME} failed #{task_name}: {result.get('result')} (retry {retry_count + 1}/{max_retries})")
-            
-            # Increment retry and requeue if not maxed
-            if retry_count + 1 < max_retries:
-                requeue_task(task_id, retry_count + 1, result.get('result'))
-            
+        status = result.get("status", "done")
+        update_task(task_id, status, result.get("result"), result.get("result_data"))
+        notify_discord(task_identifier, status, f"{AGENT_NAME} {status} {task_identifier}: {result.get('result', '')}", source_channel)
     except Exception as e:
-        log(f"Exception processing task {task_name}: {e}")
-        post_discord_status(task_name, "error", f"❌ {AGENT_NAME} crashed on #{task_name}: {e} (retry {retry_count + 1}/{max_retries})")
-        
-        # Increment retry and requeue if not maxed
+        log_error(f"Exception: {e}")
         if retry_count + 1 < max_retries:
-            requeue_task(task_id, retry_count + 1, str(e))
+            # Requeue for retry
+            supabase.table("agent_tasks").update({
+                "status": "pending",
+                "assigned_to": None,
+                "claimed_at": None,
+                "retry_count": retry_count + 1,
+                "error_message": str(e)
+            }).eq("id", task_id).execute()
+            notify_discord(task_identifier, "error", f"{AGENT_NAME} retry {retry_count+1}/{max_retries}: {e}", source_channel)
         else:
-            update_task_status(task_id, "error", error_message=str(e))
-
-
-def main():
-    log(f"Agent worker started. Capabilities: {AGENT_CAPABILITIES}")
-    log(f"Polling every {POLL_INTERVAL}s...")
-    
-    while True:
-        try:
-            tasks = get_pending_tasks()
-            
-            if tasks:
-                log(f"Found {len(tasks)} pending tasks")
-                for task in tasks:
-                    process_task(task)
-            else:
-                # No tasks, sleep
-                time.sleep(POLL_INTERVAL)
-                
-        # Update heartbeat every iteration
+            update_task(task_id, "error", error=str(e))
+            notify_discord(task_identifier, "error", f"{AGENT_NAME} failed permanently: {e}", source_channel)
+    finally:
+        current_task_id = None
         update_heartbeat("idle", None)
-        
-        except Exception as e:
-            log(f"Error in main loop: {e}")
-            time.sleep(POLL_INTERVAL)
 
+# ─── REALTIME SUBSCRIPTION ────────────────────────────────────────────────
+def on_realtime_connect():
+    global realtime_connected
+    realtime_connected = True
+    log("Realtime connected ✓")
+
+def on_realtime_disconnect():
+    global realtime_connected
+    realtime_connected = False
+    log_warn("Realtime disconnected, polling fallback active")
+
+def on_task_insert(payload):
+    """New task inserted — check if we can claim it."""
+    if not is_agent_idle():
+        return
+    task = payload.get("new", {})
+    if not task:
+        return
+    if task.get("blocked_by"):
+        log(f"New task {task.get('task_id')} is blocked, skipping")
+        return
+    if task.get("task_type") not in MY_CAPABILITIES:
+        # Reject it — explicitly mark as rejected so orchestrator knows
+        task_id = task.get("id")
+        task_identifier = task.get("task_id", task_id)
+        source_ch = task.get("source_channel")
+        try:
+            supabase.table("agent_tasks").update({
+                "status": "rejected",
+                "error_message": f"task_type '{task.get('task_type')}' not in agent capabilities {MY_CAPABILITIES}"
+            }).eq("id", task_id).execute()
+            notify_discord(task_identifier, "rejected", f"{AGENT_NAME} rejected {task_identifier}: type not supported", source_ch)
+        except Exception as e:
+            log_error(f"Reject failed: {e}")
+        return
+    if task.get("assigned_to") and task.get("assigned_to") != AGENT_NAME:
+        return
+    process_task(task)
+
+def on_task_update(payload):
+    """Task updated — e.g. blocked_by cleared, or task unblocked."""
+    task = payload.get("new", {}) or {}
+    old = payload.get("old", {})
+    if not task:
+        return
+
+    # Check if blocked_by was just cleared → task is now claimable
+    was_blocked = old.get("blocked_by") and not task.get("blocked_by")
+    is_pending = task.get("status") == "pending"
+    if was_blocked and is_pending:
+        log(f"Task {task.get('task_id')} unblocked, attempting claim")
+        if is_agent_idle() and task.get("task_type") in MY_CAPABILITIES:
+            # Pull fresh task data to avoid race on claim
+            fresh = supabase.table("agent_tasks").select("*").eq("id", task["id"]).single().execute()
+            if fresh.data:
+                process_task(fresh.data)
+        return
+
+    # If task was assigned to us and status changed to done/error, update heartbeat
+    if task.get("assigned_to") == AGENT_NAME and task.get("status") in ("done", "error"):
+        log(f"Our task {task.get('task_id')} marked {task.get('status')}")
+        update_heartbeat("idle", None)
+
+def on_task_delete(payload):
+    """Task cancelled by conductor — handle via dedicated DELETE handler.
+    
+    Note: Supabase postgres_changes DELETE payload has no 'type' field.
+    The DELETE event is handled here; do NOT duplicate in on_task_update.
+    """
+    old = payload.get("old", {})
+    if not old:
+        return
+    task_id = old.get("task_id", "unknown")
+    log(f"Task {task_id} was cancelled")
+    # If we had claimed this task, release it
+    if old.get("assigned_to") == AGENT_NAME:
+        log_warn(f"Our task {task_id} was cancelled by conductor")
+
+def subscribe_realtime():
+    """Subscribe to all agent_tasks events."""
+    try:
+        channel = supabase.channel("agent_tasks_realtime")
+        channel.on("postgres_changes",
+            {"event": "INSERT", "schema": "public", "table": "agent_tasks"},
+            on_task_insert)
+        channel.on("postgres_changes",
+            {"event": "UPDATE", "schema": "public", "table": "agent_tasks"},
+            on_task_update)
+        channel.on("postgres_changes",
+            {"event": "DELETE", "schema": "public", "table": "agent_tasks"},
+            on_task_delete)
+        channel.subscribe(callback=lambda status: (
+            on_realtime_connect() if status == "SUBSCRIBED" else on_realtime_disconnect()
+        ))
+        log("Realtime subscription active")
+    except Exception as e:
+        log_error(f"Realtime subscribe failed: {e}, falling back to polling")
+
+# ─── POLLING FALLBACK ─────────────────────────────────────────────────────
+def polling_loop():
+    """
+    Supplementary polling thread — runs alongside Realtime callbacks.
+    Catches any events during Realtime reconnection windows.
+    
+    daemon=True: this thread dies with the main process, no cleanup needed.
+    SIGTERM → handle_shutdown() releases current_task before process exits.
+    """
+    log(f"Polling active (every {POLL_INTERVAL}s)")
+    while True:
+        if shutdown_requested:
+            break
+        try:
+            tasks = get_claimable_tasks()
+            for task in tasks:
+                if shutdown_requested:
+                    break
+                process_task(task)
+        except Exception as e:
+            log_error(f"Poll error: {e}")
+        time.sleep(POLL_INTERVAL)
+
+# ─── GRACEFUL SHUTDOWN ───────────────────────────────────────────────────
+def handle_shutdown(signum, frame):
+    global shutdown_requested
+    log("Shutdown requested...")
+    shutdown_requested = True
+    if current_task_id:
+        # Mark current task as pending so another agent can pick it up
+        try:
+            supabase.table("agent_tasks").update({
+                "status": "pending",
+                "assigned_to": None,
+                "claimed_at": None,
+                "error_message": "Agent shutdown mid-execution"
+            }).eq("id", current_task_id).execute()
+            log(f"Released task {current_task_id} for re-claim")
+        except Exception as e:
+            log_error(f"Failed to release task: {e}")
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM, handle_shutdown)
+signal.signal(signal.SIGINT, handle_shutdown)
+
+# ─── MAIN ─────────────────────────────────────────────────────────────────
+def main():
+    log(f"Agent worker starting — {AGENT_NAME} v{SKILL_VERSION}")
+    log(f"Capabilities: {MY_CAPABILITIES}")
+
+    # Report startup
+    update_heartbeat("idle", None)
+
+    # Start Realtime subscription (callbacks handle INSERT/UPDATE/DELETE)
+    subscribe_realtime()
+
+    # Also run polling loop in a thread — runs alongside Realtime callbacks
+    # This catches any events missed during reconnection windows
+    poll_thread = threading.Thread(target=polling_loop, daemon=True)
+    poll_thread.start()
+
+    # Keep heartbeat alive while both threads run
+    while True:
+        if shutdown_requested:
+            break
+        update_heartbeat("idle", None)
+        time.sleep(POLL_INTERVAL)
 
 if __name__ == "__main__":
     main()
