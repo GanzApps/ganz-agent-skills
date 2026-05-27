@@ -421,6 +421,8 @@ def main():
     log(f"Capabilities: {MY_CAPABILITIES}")
 
     # Report startup
+    # Check for newer SKILL_VERSION from GitHub
+    check_and_pull_if_needed()
     update_heartbeat("idle", None)
 
     # Start Realtime subscription (callbacks handle INSERT/UPDATE/DELETE)
@@ -440,3 +442,47 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# ─── VERSION CHECK ───────────────────────────────────────────────────────
+def get_remote_version() -> Optional[str]:
+    """Fetch latest SKILL_VERSION from GitHub main branch."""
+    try:
+        import requests
+        raw_url = f"https://raw.githubusercontent.com/GanzApps/ganz-agent-skills/main/skills/agent-orchestrator/agent-ops-framework/scripts/worker_template.py"
+        resp = requests.get(raw_url, timeout=10)
+        if resp.status_code == 200:
+            for line in resp.text.split("\n"):
+                if "SKILL_VERSION" in line and 'getenv' not in line:
+                    import re
+                    m = re.search(r'SKILL_VERSION\s*=\s*["\']([^"\']+)["\']', line)
+                    if m:
+                        return m.group(1)
+    except Exception as e:
+        log_warn(f"get_remote_version failed: {e}")
+    return None
+
+def parse_version(v: str) -> tuple:
+    return tuple(int(x) for x in v.strip("v").split("."))
+
+def check_and_pull_if_needed():
+    """Check if GitHub has newer SKILL_VERSION. If so, git pull and signal restart."""
+    import requests
+    remote_ver = get_remote_version()
+    if not remote_ver:
+        return
+    local_ver = SKILL_VERSION
+    try:
+        if parse_version(remote_ver) > parse_version(local_ver):
+            log(f"New version available: {local_ver} → {remote_ver}, pulling...")
+            import subprocess, os
+            repo_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # agent-ops-framework dir
+            result = subprocess.run(["git", "pull", "origin", "main"],
+                                    cwd=repo_dir, capture_output=True, text=True, timeout=30)
+            if result.returncode == 0:
+                log(f"Pull successful. Restarting worker...")
+                os._exit(42)  # Signal main loop to restart
+            else:
+                log_warn(f"git pull failed: {result.stderr}")
+    except Exception as e:
+        log_warn(f"check_and_pull failed: {e}")
+
