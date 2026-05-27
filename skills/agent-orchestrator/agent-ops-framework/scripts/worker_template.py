@@ -210,27 +210,46 @@ def parse_source_channel(source_channel: str) -> Optional[str]:
     parts = source_channel.split(":")
     return parts[1] if len(parts) == 2 else source_channel
 
-def notify_discord(task_id: str, status: str, message: str, source_channel: str = None):
-    """Post notification to Discord Working Agent thread."""
-    emoji = {"claimed": "🎯", "running": "⏳", "done": "✅", "need_review": "🔍", "error": "🔴", "rejected": "🚫", "blocked": "🔒"}.get(status, "📋")
-    log(f"Discord [{status}]: {emoji} {message}")
+def post_discord(channel_id: str, thread_id: str, message: str, bot_token: str):
+    """Post a message to a Discord channel/thread."""
     try:
         import requests
-        bot_token = os.getenv("DISCORD_BOT_TOKEN", "")
-        if not bot_token:
-            return
-        thread_id = "1504502974632820787"
-        channel_id = "1507721977022906388"
-        payload = {"content": f"{emoji} {message}", "threadId": thread_id}
+        payload = {"content": message, "threadId": thread_id}
         resp = requests.post(
             f"https://discord.com/api/v10/channels/{channel_id}/messages",
             headers={"Authorization": f"Bot {bot_token}", "Content-Type": "application/json"},
             json=payload, timeout=10
         )
         if resp.status_code not in (200, 201):
-            log_warn(f"Discord notify failed: {resp.status_code} {resp.text[:100]}")
+            log_warn(f"Discord POST failed ({channel_id}/{thread_id}): {resp.status_code}")
     except Exception as e:
-        log_warn(f"notify_discord error: {e}")
+        log_warn(f"post_discord error: {e}")
+
+def notify_discord(task_id: str, status: str, message: str, source_channel: str = None):
+    """Post status update to:
+    1. The source_channel where the task was created (if provided)
+    2. The #monitor channel / Working Agent thread (always) — unless redundant
+    """
+    emoji = {"claimed": "🎯", "running": "⏳", "done": "✅", "need_review": "🔍", "error": "🔴", "rejected": "🚫", "blocked": "🔒"}.get(status, "📋")
+    log(f"Discord [{status}]: {emoji} {message}")
+    bot_token = os.getenv("DISCORD_BOT_TOKEN", "")
+    if not bot_token:
+        return
+
+    # Always post to #monitor / Working Agent thread
+    monitor_channel = "1497596257160659185"
+    monitor_thread  = "1504502974632820787"
+    post_discord(monitor_channel, monitor_thread, f"{emoji} {message}", bot_token)
+
+    # Also post to source channel if provided (format: "discord:CHANNEL_ID" or "CHANNEL_ID")
+    if source_channel:
+        parts = source_channel.split(":")
+        src_channel = parts[1] if len(parts) == 2 else source_channel
+        src_thread = parts[2] if len(parts) == 3 else None
+        # Avoid double-posting to same channel
+        if src_channel != monitor_channel:
+            thread_to_use = src_thread or monitor_thread  # use source thread if available
+            post_discord(src_channel, thread_to_use, f"{emoji} {message}", bot_token)
 
 # ─── PROCESS SINGLE TASK ──────────────────────────────────────────────────
 def process_task(task: dict):
