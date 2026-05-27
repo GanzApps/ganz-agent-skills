@@ -21,7 +21,7 @@ SUPABASE_URL = os.getenv("SUPABASE_URL", "https://lyhhfqbkwamodswxewql.supabase.
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")           # from .env
 AGENT_NAME = os.getenv("AGENT_NAME", "agent")           # mr-kim, zenoa, miss-x
 AGENT_CAPABILITIES = os.getenv("AGENT_CAPABILITIES", "research,code,general").split(",")
-SKILL_VERSION = os.getenv("SKILL_VERSION", "v6.0.0")
+SKILL_VERSION = os.getenv("SKILL_VERSION", "v7.0.0")
 
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "30"))   # seconds
 
@@ -142,28 +142,28 @@ def update_task(task_id: str, status: str, result: str = None,
 def execute_research(instruction: str, payload: dict) -> dict:
     """Web research task handler. Implement with Tavily/Brave Search."""
     # TODO: Implement actual research
-    return {"status": "done", "result": f"Research complete: {instruction[:50]}", "result_data": {"topic": payload.get("topic", "")}}
+    return {"status": "need_review", "result": f"Research complete: {instruction[:50]}", "result_data": {"topic": payload.get("topic", "")}}
 
 def execute_code(instruction: str, payload: dict) -> dict:
     """Code generation/review task handler."""
     # TODO: Implement actual code generation
-    return {"status": "done", "result": f"Code generated: {instruction[:50]}", "result_data": {"repo": payload.get("repo", "")}}
+    return {"status": "need_review", "result": f"Code generated: {instruction[:50]}", "result_data": {"repo": payload.get("repo", "")}}
 
 def execute_image(instruction: str, payload: dict) -> dict:
     """Image generation task handler."""
-    return {"status": "done", "result": f"Image generated: {instruction[:50]}", "result_data": {}}
+    return {"status": "need_review", "result": f"Image generated: {instruction[:50]}", "result_data": {}}
 
 def execute_video(instruction: str, payload: dict) -> dict:
     """Video generation task handler."""
-    return {"status": "done", "result": f"Video generated: {instruction[:50]}", "result_data": {}}
+    return {"status": "need_review", "result": f"Video generated: {instruction[:50]}", "result_data": {}}
 
 def execute_file(instruction: str, payload: dict) -> dict:
     """File operations task handler."""
-    return {"status": "done", "result": f"File op complete: {instruction[:50]}", "result_data": {}}
+    return {"status": "need_review", "result": f"File op complete: {instruction[:50]}", "result_data": {}}
 
 def execute_deploy(instruction: str, payload: dict) -> dict:
     """Deployment task handler."""
-    return {"status": "done", "result": f"Deployed: {instruction[:50]}", "result_data": {}}
+    return {"status": "need_review", "result": f"Deployed: {instruction[:50]}", "result_data": {}}
 
 def execute_setup(instruction: str, payload: dict) -> dict:
     """Setup/prerequisite task handler."""
@@ -171,7 +171,7 @@ def execute_setup(instruction: str, payload: dict) -> dict:
 
 def execute_general(instruction: str, payload: dict) -> dict:
     """Fallback handler for unknown types."""
-    return {"status": "done", "result": f"Done: {instruction[:50]}", "result_data": {}}
+    return {"status": "need_review", "result": f"Done: {instruction[:50]}", "result_data": {}}
 
 # Generic handler map
 TASK_HANDLERS = {
@@ -211,11 +211,26 @@ def parse_source_channel(source_channel: str) -> Optional[str]:
     return parts[1] if len(parts) == 2 else source_channel
 
 def notify_discord(task_id: str, status: str, message: str, source_channel: str = None):
-    """Post notification to Discord source channel."""
-    # TODO: Implement actual Discord bot posting
-    # For now, just log
-    emoji = {"claimed": "🎯", "running": "⏳", "done": "✅", "error": "🔴", "blocked": "🔒"}.get(status, "📋")
+    """Post notification to Discord Working Agent thread."""
+    emoji = {"claimed": "🎯", "running": "⏳", "done": "✅", "need_review": "🔍", "error": "🔴", "rejected": "🚫", "blocked": "🔒"}.get(status, "📋")
     log(f"Discord [{status}]: {emoji} {message}")
+    try:
+        import requests
+        bot_token = os.getenv("DISCORD_BOT_TOKEN", "")
+        if not bot_token:
+            return
+        thread_id = "1504502974632820787"
+        channel_id = "1507721977022906388"
+        payload = {"content": f"{emoji} {message}", "threadId": thread_id}
+        resp = requests.post(
+            f"https://discord.com/api/v10/channels/{channel_id}/messages",
+            headers={"Authorization": f"Bot {bot_token}", "Content-Type": "application/json"},
+            json=payload, timeout=10
+        )
+        if resp.status_code not in (200, 201):
+            log_warn(f"Discord notify failed: {resp.status_code} {resp.text[:100]}")
+    except Exception as e:
+        log_warn(f"notify_discord error: {e}")
 
 # ─── PROCESS SINGLE TASK ──────────────────────────────────────────────────
 def process_task(task: dict):
